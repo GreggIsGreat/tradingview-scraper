@@ -1,15 +1,6 @@
 """
-Persistent TradingView WebSocket client.
-
-Manages:
- - Single WebSocket connection with auto-reconnect
- - Quote session  → real-time price streaming, cached per symbol
- - Chart sessions → OHLCV candles, one session per fetch (on-demand)
-
-FIXES v2.1:
- - _connected is set AFTER _on_open finishes (no race condition)
- - Duplicate quote_add_symbols prevented with _qs_sent tracking
- - "already in session" errors handled gracefully (no crash)
+TradingView WebSocket client - serverless compatible.
+Each call opens a fresh WS, gets data, closes.
 """
 from __future__ import annotations
 
@@ -18,8 +9,6 @@ import logging
 import random
 import string
 import threading
-import time
-from dataclasses import dataclass, field
 
 import websocket
 
@@ -34,26 +23,23 @@ QUOTE_FIELDS = [
     "volume", "bid", "ask",
     "lp_time", "short_name", "description", "exchange",
     "type", "currency_code", "current_session", "status",
-    "rtc", "rch", "rchp", "is_tradable",
 ]
 
 
-# ── Protocol helpers ─────────────────────────────────────────
-
-def _rand(prefix: str = "cs_", n: int = 12) -> str:
+def _rand(prefix="cs_", n=12):
     return prefix + "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
-def _pack(payload: str) -> str:
-    return f"~m~{len(payload)}~m~{payload}"
+def _pack(payload):
+    return "~m~" + str(len(payload)) + "~m~" + payload
 
 
-def _msg(method: str, params: list) -> str:
+def _msg(method, params):
     return _pack(json.dumps({"m": method, "p": params}, separators=(",", ":")))
 
 
-def _split(raw: str) -> list[str]:
-    msgs: list[str] = []
+def _split(raw):
+    msgs = []
     i = 0
     n = len(raw)
     while i < n:
@@ -74,334 +60,34 @@ def _split(raw: str) -> list[str]:
     return msgs
 
 
-# ── Per-chart-session state ──────────────────────────────────
-
-@dataclass
-class _ChartCtx:
-    chart_session: str
-    sym_resolved: threading.Event = field(default_factory=threading.Event)
-    series_done: threading.Event = field(default_factory=threading.Event)
-    candles: list = field(default_factory=list)
-    errors: list = field(default_factory=list)
+_WS_HEADERS = {
+    "Origin": "https://www.tradingview.com",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+}
 
 
-# ══════════════════════════════════════════════════════════════
-#  TvClient
-# ══════════════════════════════════════════════════════════════
+def fetch_quote(symbol, timeout=15.0):
+    cfg = get_settings()
+    qs = _rand("qs_")
+    result = {}
+    connected = threading.Event()
+    got_data = threading.Event()
+    errors = []
 
-class TvClient:
-    """
-    Persistent TradingView WebSocket client.
+    logger.info("fetch_quote: connecting for %s", symbol)
 
-    Call ``start()`` once. Then:
-      - ``get_quote(symbol)``            → cached real-time price dict
-      - ``fetch_candles(symbol,tf,n)``   → list[Candle]
-      - ``subscribe_quote(symbol)``      → pre-warm cache
-
-    Call ``stop()`` to shut down.
-    """
-
-    def __init__(self, auth_token: str | None = None):
-        cfg = get_settings()
-        self._url = cfg.tv_ws_url
-        self._token = auth_token or cfg.tv_auth_token
-        self._origin = cfg.tv_origin
-        self._timeout = cfg.ws_timeout
-        self._reconnect_delay = cfg.reconnect_delay
-
-        self._headers = {
-            "Origin": self._origin,
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        }
-
-        # connection state
-        self._ws: websocket.WebSocketApp | None = None
-        self._connected = threading.Event()
-        self._running = False
-        self._send_lock = threading.Lock()
-
-        # quote session
-        self._qs_id = _rand("qs_")
-        self._quotes: dict[str, dict] = {}
-        self._quote_ready: dict[str, threading.Event] = {}
-        self._subscribed_symbols: set[str] = set()    # desired subscriptions
-        self._qs_sent: set[str] = set()               # actually sent this session
-        self._quote_lock = threading.Lock()
-
-        # chart sessions
-        self._charts: dict[str, _ChartCtx] = {}
-        self._chart_lock = threading.Lock()
-        self._chart_sem = threading.Semaphore(cfg.max_concurrent_charts)
-
-    # ── lifecycle ────────────────────────────────────────────
-
-    def start(self, timeout: float | None = None) -> None:
-        timeout = timeout or self._timeout
-        self._running = True
-        self._conn_thread = threading.Thread(target=self._connection_loop, daemon=True)
-        self._conn_thread.start()
-        if not self._connected.wait(timeout):
-            raise ConnectionError(
-                "Initial connection to TradingView failed. "
-                "Check your network and TV_AUTH_TOKEN."
-            )
-        logger.info("TvClient started")
-
-    def stop(self) -> None:
-        self._running = False
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
-        logger.info("TvClient stopped")
-
-    @property
-    def is_connected(self) -> bool:
-        return self._connected.is_set()
-
-    @property
-    def subscribed_symbols(self) -> list[str]:
-        with self._quote_lock:
-            return list(self._subscribed_symbols)
-
-    @property
-    def cached_quote_count(self) -> int:
-        with self._quote_lock:
-            return len(self._quotes)
-
-    # ── auto-reconnect loop ──────────────────────────────────
-
-    def _connection_loop(self) -> None:
-        while self._running:
-            self._connected.clear()
-            self._qs_id = _rand("qs_")
-
-            # clear the "sent" tracker — new session means fresh state
-            with self._quote_lock:
-                self._qs_sent.clear()
-
-            ws = websocket.WebSocketApp(
-                self._url,
-                on_open=self._on_open,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close,
-                header=self._headers,
-            )
-            self._ws = ws
-
-            try:
-                ws.run_forever(ping_interval=25, ping_timeout=10)
-            except Exception as exc:
-                logger.error("WS run_forever error: %s", exc)
-
-            if self._running:
-                logger.info(
-                    "Connection lost. Reconnecting in %.0fs…",
-                    self._reconnect_delay,
-                )
-                time.sleep(self._reconnect_delay)
-
-    def _ensure_connected(self, timeout: float = 15.0) -> None:
-        if not self._running:
-            raise RuntimeError("TvClient not started. Call start() first.")
-        if not self._connected.wait(timeout):
-            raise ConnectionError("Not connected to TradingView")
-
-    # ── quote API ────────────────────────────────────────────
-
-    def subscribe_quote(self, symbol: str) -> None:
-        """Subscribe to real-time quote stream for *symbol*."""
-        self._ensure_connected()
-        with self._quote_lock:
-            # always add to desired set
-            self._subscribed_symbols.add(symbol)
-
-            # only send if not already sent in this session
-            if symbol in self._qs_sent:
-                logger.debug("Already subscribed in this session: %s", symbol)
-                return
-            self._qs_sent.add(symbol)
-            self._quote_ready[symbol] = threading.Event()
-
-        self._send("quote_add_symbols", [self._qs_id, symbol])
-        logger.info("Subscribed to quote: %s", symbol)
-
-    def get_quote(self, symbol: str, timeout: float = 10.0) -> dict:
-        """
-        Return latest quote data dict for *symbol*.
-
-        First call for a new symbol subscribes and waits.
-        Subsequent calls return from cache instantly.
-        """
-        self._ensure_connected()
-
-        # fast path: already have cached data
-        with self._quote_lock:
-            cached = self._quotes.get(symbol)
-            if cached:
-                return dict(cached)
-
-        # slow path: subscribe and wait for first push
-        self.subscribe_quote(symbol)
-        ev = self._quote_ready.get(symbol)
-        if ev and not ev.wait(timeout):
-            with self._quote_lock:
-                cached = self._quotes.get(symbol)
-                if cached:
-                    return dict(cached)
-            raise TimeoutError(
-                f"No quote data for {symbol} within {timeout}s. "
-                f"Is the symbol correct? Is the market open?"
-            )
-
-        with self._quote_lock:
-            data = self._quotes.get(symbol, {})
-            if not data:
-                raise TimeoutError(f"Quote data empty for {symbol}")
-            return dict(data)
-
-    # ── candle API ───────────────────────────────────────────
-
-    def fetch_candles(
-        self,
-        symbol: str,
-        timeframe: str,
-        num_bars: int,
-        timeout: float = 60.0,
-    ) -> list[Candle]:
-        """
-        Fetch OHLCV candles. Creates a temporary chart session,
-        fetches data, paginates if needed, cleans up.
-        """
-        self._ensure_connected()
-
-        cs = _rand("cs_")
-        ctx = _ChartCtx(chart_session=cs)
-
-        acquired = self._chart_sem.acquire(timeout=timeout)
-        if not acquired:
-            raise TimeoutError("Too many concurrent candle requests.")
-
-        with self._chart_lock:
-            self._charts[cs] = ctx
-
+    def on_open(ws):
+        logger.info("fetch_quote: connected")
         try:
-            return self._do_fetch(ctx, symbol, timeframe, num_bars, timeout)
-        finally:
-            self._chart_sem.release()
-            try:
-                self._send("chart_delete_session", [cs])
-            except Exception:
-                pass
-            with self._chart_lock:
-                self._charts.pop(cs, None)
+            ws.send(_msg("set_auth_token", [cfg.tv_auth_token]))
+            ws.send(_msg("quote_create_session", [qs]))
+            ws.send(_msg("quote_set_fields", [qs] + QUOTE_FIELDS))
+            ws.send(_msg("quote_add_symbols", [qs, symbol]))
+        except Exception as exc:
+            errors.append(str(exc))
+        connected.set()
 
-    def _do_fetch(
-        self,
-        ctx: _ChartCtx,
-        symbol: str,
-        timeframe: str,
-        num_bars: int,
-        timeout: float,
-    ) -> list[Candle]:
-        cs = ctx.chart_session
-
-        # 1. create chart session
-        self._send("chart_create_session", [cs, ""])
-        self._send("switch_timezone", [cs, "Etc/UTC"])
-
-        # 2. resolve symbol
-        sym_cfg = json.dumps({
-            "symbol": symbol,
-            "adjustment": "splits",
-            "session": "extended",
-        })
-        self._send("resolve_symbol", [cs, "sds_sym_1", "=" + sym_cfg])
-
-        if not ctx.sym_resolved.wait(timeout):
-            raise TimeoutError(f"Symbol resolution timed out: {symbol}")
-        if ctx.errors:
-            raise ValueError(f"Symbol error: {ctx.errors[-1]}")
-
-        # 3. create series
-        self._send("create_series", [
-            cs, "sds_1", "s1", "sds_sym_1", timeframe, num_bars, "",
-        ])
-
-        if not ctx.series_done.wait(timeout):
-            logger.warning("series timed out, returning partial data")
-
-        # 4. paginate
-        count = len(ctx.candles)
-        pages = 0
-        while count < num_bars and pages < 10:
-            remaining = num_bars - count
-            if remaining <= 0:
-                break
-            ctx.series_done.clear()
-            self._send("request_more_data", [cs, "sds_1", remaining])
-
-            if not ctx.series_done.wait(min(timeout, 30)):
-                break
-            new_count = len(ctx.candles)
-            if new_count <= count:
-                break
-            count = new_count
-            pages += 1
-
-        # 5. deduplicate + sort
-        seen: set[float] = set()
-        unique: list[Candle] = []
-        for c in ctx.candles:
-            if c.timestamp not in seen:
-                seen.add(c.timestamp)
-                unique.append(c)
-        unique.sort(key=lambda c: c.timestamp)
-
-        logger.info(
-            "Fetched %d candles (requested %d)  tf=%s  session=%s",
-            len(unique), num_bars, timeframe, cs,
-        )
-        return unique
-
-    # ── WS callbacks ─────────────────────────────────────────
-
-    def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        logger.info("WS connected")
-
-        # ── 1. authenticate ──
-        self._send("set_auth_token", [self._token])
-
-        # ── 2. create quote session ──
-        self._send("quote_create_session", [self._qs_id])
-        self._send("quote_set_fields", [self._qs_id, *QUOTE_FIELDS])
-
-        # ── 3. re-subscribe all desired symbols ──
-        with self._quote_lock:
-            self._qs_sent.clear()  # fresh session, nothing sent yet
-            for sym in self._subscribed_symbols:
-                self._qs_sent.add(sym)
-                self._quote_ready[sym] = threading.Event()
-                self._send("quote_add_symbols", [self._qs_id, sym])
-            count = len(self._subscribed_symbols)
-
-        logger.info(
-            "Quote session %s ready, re-subscribed %d symbols",
-            self._qs_id, count,
-        )
-
-        # ── 4. NOW signal connected ──
-        # This MUST be last so that subscribe_quote() called from
-        # engine.start_client() can't race with the re-subscribe loop above
-        self._connected.set()
-
-    def _on_message(self, ws: websocket.WebSocketApp, raw: str) -> None:
+    def on_message(ws, raw):
         for payload in _split(raw):
             if payload.startswith("~h~"):
                 try:
@@ -411,149 +97,220 @@ class TvClient:
                 continue
             try:
                 data = json.loads(payload)
-            except (json.JSONDecodeError, ValueError):
+            except Exception:
                 continue
-            if isinstance(data, dict) and "m" in data:
-                self._dispatch(data["m"], data.get("p", []))
+            if not isinstance(data, dict) or "m" not in data:
+                continue
+            method = data.get("m", "")
+            params = data.get("p", [])
+            if method == "qsd":
+                if len(params) >= 2 and isinstance(params[1], dict):
+                    vals = params[1].get("v")
+                    if isinstance(vals, dict):
+                        result.update(vals)
+                        if vals.get("lp") is not None:
+                            logger.info("fetch_quote: price=%s", vals.get("lp"))
+                            got_data.set()
+            elif method == "critical_error":
+                if "already in session" not in str(params):
+                    errors.append(str(params))
+                    got_data.set()
 
-    def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
-        logger.error("WS error: %s", error)
+    def on_error(ws, error):
+        logger.error("fetch_quote: error %s", error)
+        errors.append(str(error))
+        connected.set()
+        got_data.set()
 
-    def _on_close(
-        self, ws: websocket.WebSocketApp, code: int | None, msg: str | None,
-    ) -> None:
-        logger.info("WS closed  code=%s  msg=%s", code, msg)
-        self._connected.clear()
-        with self._chart_lock:
-            for ctx in self._charts.values():
-                ctx.errors.append("Connection closed")
-                ctx.sym_resolved.set()
-                ctx.series_done.set()
+    def on_close(ws, code, msg):
+        connected.set()
+        got_data.set()
 
-    # ── message dispatch ─────────────────────────────────────
+    ws = websocket.WebSocketApp(
+        cfg.tv_ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        header=_WS_HEADERS,
+    )
+    thread = threading.Thread(target=ws.run_forever, daemon=True)
+    thread.start()
 
-    def _send(self, method: str, params: list) -> None:
-        with self._send_lock:
-            if self._ws:
+    if not connected.wait(timeout):
+        ws.close()
+        raise ConnectionError("WS connection timed out")
+
+    if not got_data.wait(timeout):
+        ws.close()
+        if result and result.get("lp") is not None:
+            return result
+        raise TimeoutError("No quote data for " + symbol)
+
+    ws.close()
+    thread.join(timeout=3)
+
+    if errors and not result:
+        raise ConnectionError("WS error: " + errors[0])
+
+    return result
+
+
+def fetch_candles(symbol, timeframe, num_bars, timeout=20.0):
+    cfg = get_settings()
+    cs = _rand("cs_")
+    candles = []
+    connected = threading.Event()
+    sym_resolved = threading.Event()
+    series_done = threading.Event()
+    errors = []
+    lock = threading.Lock()
+
+    logger.info("fetch_candles: %s tf=%s bars=%d", symbol, timeframe, num_bars)
+
+    def on_open(ws):
+        logger.info("fetch_candles: connected")
+        try:
+            ws.send(_msg("set_auth_token", [cfg.tv_auth_token]))
+            ws.send(_msg("chart_create_session", [cs, ""]))
+            ws.send(_msg("switch_timezone", [cs, "Etc/UTC"]))
+            sym_cfg = json.dumps({"symbol": symbol, "adjustment": "splits", "session": "extended"})
+            ws.send(_msg("resolve_symbol", [cs, "sds_sym_1", "=" + sym_cfg]))
+        except Exception as exc:
+            errors.append(str(exc))
+        connected.set()
+
+    def on_message(ws, raw):
+        for payload in _split(raw):
+            if payload.startswith("~h~"):
                 try:
-                    self._ws.send(_msg(method, params))
+                    ws.send(_pack(payload))
+                except Exception:
+                    pass
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(data, dict) or "m" not in data:
+                continue
+            method = data["m"]
+            params = data.get("p", [])
+
+            if method == "symbol_resolved":
+                logger.info("fetch_candles: symbol resolved")
+                sym_resolved.set()
+                try:
+                    ws.send(_msg("create_series", [cs, "sds_1", "s1", "sds_sym_1", timeframe, num_bars, ""]))
                 except Exception as exc:
-                    logger.error("Send failed (%s): %s", method, exc)
+                    errors.append(str(exc))
+                    series_done.set()
 
-    def _dispatch(self, method: str, params: list) -> None:
-        handlers = {
-            "qsd":              self._on_qsd,
-            "timescale_update": self._on_chart_data,
-            "du":               self._on_chart_data,
-            "series_completed": self._on_series_completed,
-            "symbol_resolved":  self._on_sym_resolved,
-            "symbol_error":     self._on_sym_error,
-            "series_error":     self._on_series_error,
-            "critical_error":   self._on_critical_error,
-        }
-        h = handlers.get(method)
-        if h:
-            h(params)
+            elif method == "symbol_error":
+                errors.append("symbol_error: " + str(params))
+                sym_resolved.set()
+                series_done.set()
 
-    # ── quote handlers ───────────────────────────────────────
+            elif method in ("timescale_update", "du"):
+                if len(params) >= 2 and isinstance(params[1], dict):
+                    for _key, sdata in params[1].items():
+                        if not isinstance(sdata, dict):
+                            continue
+                        bars_data = sdata.get("s") or sdata.get("st")
+                        if not bars_data:
+                            continue
+                        with lock:
+                            for bar in bars_data:
+                                v = bar.get("v", [])
+                                if len(v) >= 5:
+                                    candles.append(Candle(
+                                        timestamp=v[0], open=v[1], high=v[2],
+                                        low=v[3], close=v[4],
+                                        volume=v[5] if len(v) > 5 else 0.0,
+                                    ))
+                    logger.info("fetch_candles: have %d candles", len(candles))
 
-    def _on_qsd(self, params: list) -> None:
-        if len(params) < 2 or not isinstance(params[1], dict):
-            return
-        qdata = params[1]
-        symbol = qdata.get("n", "")
-        values = qdata.get("v")
-        if not symbol or not isinstance(values, dict):
-            return
+            elif method == "series_completed":
+                logger.info("fetch_candles: series done %d candles", len(candles))
+                series_done.set()
 
-        with self._quote_lock:
-            if symbol not in self._quotes:
-                self._quotes[symbol] = {}
-            self._quotes[symbol].update(values)
-            ev = self._quote_ready.get(symbol)
-            if ev:
-                ev.set()
+            elif method == "critical_error":
+                if "already in session" not in str(params):
+                    errors.append("critical_error: " + str(params))
+                    series_done.set()
 
-    # ── chart handlers ───────────────────────────────────────
+            elif method == "series_error":
+                errors.append("series_error: " + str(params))
+                series_done.set()
 
-    def _chart_ctx(self, params: list) -> _ChartCtx | None:
-        if not params:
-            return None
-        with self._chart_lock:
-            return self._charts.get(params[0])
+    def on_error(ws, error):
+        logger.error("fetch_candles: error %s", error)
+        errors.append(str(error))
+        connected.set()
+        sym_resolved.set()
+        series_done.set()
 
-    def _on_chart_data(self, params: list) -> None:
-        ctx = self._chart_ctx(params)
-        if not ctx or len(params) < 2 or not isinstance(params[1], dict):
-            return
-        for _key, sdata in params[1].items():
-            if not isinstance(sdata, dict):
-                continue
-            bars = sdata.get("s") or sdata.get("st")
-            if not bars:
-                continue
-            for bar in bars:
-                v = bar.get("v", [])
-                if len(v) < 5:
-                    continue
-                ctx.candles.append(Candle(
-                    timestamp=v[0],
-                    open=v[1],
-                    high=v[2],
-                    low=v[3],
-                    close=v[4],
-                    volume=v[5] if len(v) > 5 else 0.0,
-                ))
+    def on_close(ws, code, msg):
+        connected.set()
+        sym_resolved.set()
+        series_done.set()
 
-    def _on_series_completed(self, params: list) -> None:
-        ctx = self._chart_ctx(params)
-        if ctx:
-            ctx.series_done.set()
+    ws = websocket.WebSocketApp(
+        cfg.tv_ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        header=_WS_HEADERS,
+    )
+    thread = threading.Thread(target=ws.run_forever, daemon=True)
+    thread.start()
 
-    def _on_sym_resolved(self, params: list) -> None:
-        ctx = self._chart_ctx(params)
-        if ctx:
-            ctx.sym_resolved.set()
+    if not connected.wait(timeout):
+        ws.close()
+        raise ConnectionError("WS connection timed out")
 
-    def _on_sym_error(self, params: list) -> None:
-        ctx = self._chart_ctx(params)
-        err = f"symbol_error: {params}"
-        logger.error(err)
-        if ctx:
-            ctx.errors.append(err)
-            ctx.sym_resolved.set()
-            ctx.series_done.set()
+    if not sym_resolved.wait(timeout):
+        ws.close()
+        raise TimeoutError("Symbol resolution timed out: " + symbol)
 
-    def _on_series_error(self, params: list) -> None:
-        ctx = self._chart_ctx(params)
-        err = f"series_error: {params}"
-        logger.error(err)
-        if ctx:
-            ctx.errors.append(err)
-            ctx.series_done.set()
+    if errors:
+        ws.close()
+        raise ValueError(errors[0])
 
-    def _on_critical_error(self, params: list) -> None:
-        err_str = str(params)
+    series_done.wait(timeout)
 
-        # ── Handle "already in session" gracefully ──
-        # This is a quote-session error, NOT a real crash.
-        # Just log it and move on — don't kill chart sessions.
-        if "already in session" in err_str:
-            logger.warning("Quote duplicate ignored: %s", err_str)
-            return
+    pages = 0
+    while len(candles) < num_bars and pages < 5:
+        remaining = num_bars - len(candles)
+        if remaining <= 0:
+            break
+        count_before = len(candles)
+        series_done.clear()
+        try:
+            ws.send(_msg("request_more_data", [cs, "sds_1", remaining]))
+        except Exception:
+            break
+        if not series_done.wait(min(timeout, 15)):
+            break
+        if len(candles) <= count_before:
+            break
+        pages += 1
 
-        logger.error("critical_error: %s", err_str)
+    try:
+        ws.send(_msg("chart_delete_session", [cs]))
+    except Exception:
+        pass
+    ws.close()
+    thread.join(timeout=3)
 
-        # only propagate to chart sessions
-        ctx = self._chart_ctx(params)
-        if ctx:
-            ctx.errors.append(f"critical_error: {err_str}")
-            ctx.sym_resolved.set()
-            ctx.series_done.set()
-        else:
-            # can't determine session — unblock all charts
-            with self._chart_lock:
-                for c in self._charts.values():
-                    c.errors.append(f"critical_error: {err_str}")
-                    c.sym_resolved.set()
-                    c.series_done.set()
+    seen = set()
+    unique = []
+    for c in candles:
+        if c.timestamp not in seen:
+            seen.add(c.timestamp)
+            unique.append(c)
+    unique.sort(key=lambda x: x.timestamp)
+
+    logger.info("fetch_candles: returning %d candles tf=%s", len(unique), timeframe)
+    return unique
