@@ -1,0 +1,10 @@
+## To start the server locally
+1. Install requirments
+2. activate your venv
+3. run "python main.py serve" to start the server
+
+
+
+# Testing 
+python main.py price OANDA:XAUUSD
+python main.py candles OANDA:NAS100USD -t 1 15 -r 1h
