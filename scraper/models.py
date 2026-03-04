@@ -4,8 +4,6 @@ from dataclasses import dataclass, asdict
 from pydantic import BaseModel, Field
 
 
-# ── Internal ─────────────────────────────────────────────────
-
 @dataclass
 class Candle:
     timestamp: float
@@ -19,13 +17,11 @@ class Candle:
         return asdict(self)
 
 
-# ── API Requests ─────────────────────────────────────────────
-
 class CandleRequest(BaseModel):
-    symbol: str = Field(..., description="e.g. OANDA:XAUUSD, BTCUSD, or TradingView URL")
-    timeframe: str = Field(default="1", description="1, 5, 15, 60, D …")
-    range: str = Field(default="1h", description="1h, 4h, 1d, 1w …")
-    bars: Optional[int] = Field(default=None, description="Override: exact bar count")
+    symbol: str = Field(...)
+    timeframe: str = Field(default="1")
+    range: str = Field(default="1h")
+    bars: Optional[int] = Field(default=None)
 
 
 class BatchPriceRequest(BaseModel):
@@ -39,8 +35,6 @@ class BatchCandleRequest(BaseModel):
 class SubscribeRequest(BaseModel):
     symbols: list[str]
 
-
-# ── API Responses ────────────────────────────────────────────
 
 class PriceResponse(BaseModel):
     symbol: str
@@ -64,13 +58,13 @@ class PriceResponse(BaseModel):
 
 
 class CandleOut(BaseModel):
-    t: float           # timestamp
-    dt: str            # ISO datetime
-    o: float           # open
-    h: float           # high
-    l: float           # low
-    c: float           # close
-    v: float           # volume
+    t: float
+    dt: str
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
 
 
 class CandleResponse(BaseModel):
@@ -91,6 +85,5 @@ class SymbolSearchResult(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    ws_connected: bool
+    mode: str
     subscribed_symbols: list[str]
-    cached_quotes: int

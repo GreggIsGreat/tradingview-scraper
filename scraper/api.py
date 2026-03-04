@@ -1,5 +1,6 @@
 """
-FastAPI app — works locally (uvicorn) and on Vercel (mangum).
+FastAPI app — stateless, works locally and on Vercel.
+No persistent client, no startup/shutdown lifecycle needed.
 """
 from __future__ import annotations
 
@@ -24,34 +25,27 @@ from .symbols import search_symbols
 
 logger = logging.getLogger(__name__)
 
-# ── Resolve paths that work both locally and on Vercel ──
-_THIS_DIR = Path(__file__).resolve().parent          # scraper/
-_PROJECT_ROOT = _THIS_DIR.parent                      # tradingview-scraper/
-
-# Try multiple possible template locations
-_TEMPLATE_DIRS = [
-    _PROJECT_ROOT / "templates",
-    _THIS_DIR / "templates",
-    Path(os.getcwd()) / "templates",
-]
+# ── Template path resolution ────────────────────────────────
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent
 
 _TEMPLATE_DIR = None
-for d in _TEMPLATE_DIRS:
+for d in [_PROJECT_ROOT / "templates", _THIS_DIR / "templates", Path(os.getcwd()) / "templates"]:
     if d.exists() and (d / "index.html").exists():
         _TEMPLATE_DIR = d
         break
 
-if _TEMPLATE_DIR is None:
-    # Fallback: create inline template
-    _TEMPLATE_DIR = _PROJECT_ROOT / "templates"
-    _TEMPLATE_DIR.mkdir(exist_ok=True)
+if _TEMPLATE_DIR:
+    TEMPLATES = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+else:
+    TEMPLATES = None
 
-TEMPLATES = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+# ── App ──────────────────────────────────────────────────────
 
 app = FastAPI(
     title="TradingView Data Service",
     version="2.2.0",
-    description="Real-time price & OHLCV candle data from TradingView. Serverless compatible.",
+    description="Real-time price & OHLCV candle data from TradingView.",
 )
 
 app.add_middleware(
@@ -62,6 +56,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── Helpers ──────────────────────────────────────────────────
 
 def _quote_to_price(symbol: str, q: dict) -> PriceResponse:
     session = q.get("current_session", "")
@@ -100,28 +96,29 @@ def _candle_out(c) -> CandleOut:
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     cfg = get_settings()
-    try:
-        return TEMPLATES.TemplateResponse("index.html", {
-            "request": request,
-            "symbols": cfg.auto_subscribe_symbols,
-            "ranges": list(RANGE_MINUTES.keys()),
-            "timeframes": list(TIMEFRAME_MINUTES.keys()),
-        })
-    except Exception as exc:
-        # If template not found, return a simple working page
-        logger.error("Template error: %s", exc)
-        symbols = cfg.auto_subscribe_symbols
-        return HTMLResponse(f"""
-        <html><head><title>TV Data Service</title></head>
-        <body style="background:#0b0d11;color:#e0e0e0;font-family:sans-serif;padding:40px;text-align:center">
-        <h1>📊 TradingView Data Service</h1>
-        <p>API is running. Template not found.</p>
-        <h3>Endpoints:</h3>
-        <p><a href="/docs" style="color:#2962ff">/docs</a> — Swagger UI</p>
-        <p><a href="/api/health" style="color:#2962ff">/api/health</a></p>
-        <p><a href="/api/price?symbol={symbols[0]}" style="color:#2962ff">/api/price?symbol={symbols[0]}</a></p>
-        </body></html>
-        """)
+    if TEMPLATES:
+        try:
+            return TEMPLATES.TemplateResponse("index.html", {
+                "request": request,
+                "symbols": cfg.auto_subscribe_symbols,
+                "ranges": list(RANGE_MINUTES.keys()),
+                "timeframes": list(TIMEFRAME_MINUTES.keys()),
+            })
+        except Exception as exc:
+            logger.error("Template error: %s", exc)
+
+    # Fallback if template not found
+    syms = cfg.auto_subscribe_symbols
+    return HTMLResponse(f"""
+    <html><head><title>TV Data Service</title></head>
+    <body style="background:#0b0d11;color:#e0e0e0;font-family:sans-serif;padding:40px;text-align:center">
+    <h1>📊 TradingView Data Service</h1>
+    <p>API is running.</p>
+    <p><a href="/docs" style="color:#2962ff">/docs</a> — Swagger</p>
+    <p><a href="/api/health" style="color:#2962ff">/api/health</a></p>
+    <p><a href="/api/price?symbol={syms[0]}" style="color:#2962ff">/api/price?symbol={syms[0]}</a></p>
+    </body></html>
+    """)
 
 
 # ── Price ────────────────────────────────────────────────────
